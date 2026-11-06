@@ -4,7 +4,12 @@
 
 #include "tesworld/Profiling.h"
 
+#if TESWORLD_ORG_GRAPH_HOST
+#include <OpenRenderGraph/GraphHost.h>
+#include <OpenRenderGraph/Runtime.h>
+#else
 #include <OpenRenderGraph/PersistentGraphHost.h>
+#endif
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Render/Runtime/ThreadPoolTaskService.h>
 #include <RenderPasses/Base/TypedRenderGraphPass.h>
@@ -30,6 +35,8 @@ namespace tesworld::gpu
 			constexpr std::uint32_t kDescriptorCapacity = 1u << 14;
 			// Render and depth targets alive at once.
 			constexpr std::uint32_t kTargetCapacity = 32;
+			// Samplers callers create (Compute::CreateSampler); they're never freed.
+			constexpr std::uint32_t kSamplerCapacity = 16;
 
 			void Check(rhi::Result a_result, const char* a_what)
 			{
@@ -250,7 +257,7 @@ namespace tesworld::gpu
 			rhi::DescriptorHeapDesc heapDesc{ rhi::DescriptorHeapType::CbvSrvUav, kDescriptorCapacity, true, "tesworld descriptors" };
 			Check(_device->CreateDescriptorHeap(heapDesc, _heap), "descriptor heap");
 			// Bindless root signatures index the sampler heap too, so one must be bound.
-			rhi::DescriptorHeapDesc samplerDesc{ rhi::DescriptorHeapType::Sampler, 16, true, "tesworld samplers" };
+			rhi::DescriptorHeapDesc samplerDesc{ rhi::DescriptorHeapType::Sampler, kSamplerCapacity, true, "tesworld samplers" };
 			Check(_device->CreateDescriptorHeap(samplerDesc, _samplerHeap), "sampler heap");
 			rhi::DescriptorHeapDesc rtvDesc{ rhi::DescriptorHeapType::RTV, kTargetCapacity, false, "tesworld render targets" };
 			Check(_device->CreateDescriptorHeap(rtvDesc, _rtvHeap), "render target heap");
@@ -261,6 +268,19 @@ namespace tesworld::gpu
 				_freeDsvs.push_back(i);
 			}
 
+#if TESWORLD_ORG_GRAPH_HOST
+			_runtime = org::Runtime::Create(org::Runtime::Desc{
+				.device = _device.Get(),
+				.backend = _backend,
+				.slots = 2,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
+			});
+			_host = std::make_unique<org::GraphHost>(org::GraphHost::Desc{
+				.runtime = _runtime,
+				.framesInFlight = 2,
+				.epochOrder = {},
+			});
+#else
 			_host = std::make_unique<org::PersistentGraphHost>(org::PersistentGraphHost::Desc{
 				.device = _device.Get(),
 				.backend = _backend,
@@ -268,6 +288,7 @@ namespace tesworld::gpu
 				.framesInFlight = 2,
 				.epochOrder = {},
 			});
+#endif
 			_heartbeat = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 256, true);
 			org::BufferBase::DescriptorRequirements requirements{};
 			requirements.createUAV = true;
@@ -353,6 +374,9 @@ namespace tesworld::gpu
 			_rtvHeap.Reset();
 			_dsvHeap.Reset();
 			_host.reset();
+#if TESWORLD_ORG_GRAPH_HOST
+			_runtime.reset();
+#endif
 			_device.Reset();
 		}
 
@@ -368,6 +392,14 @@ namespace tesworld::gpu
 			if (bytes.empty()) {
 				throw UnsupportedError("this build has no " + name);
 			}
+			return CreateProgram(bytes, a_entry, a_constantWords);
+		}
+
+		ComputeProgram ContextImpl::CreateProgram(std::span<const std::byte> a_bytes, std::string_view a_entry, std::uint32_t a_constantWords)
+		{
+			if (a_bytes.empty()) {
+				throw UnsupportedError(std::string("no ") + ApiName(_api) + " bytecode for " + std::string(a_entry));
+			}
 			ComputeProgram program;
 			program.constantWords = a_constantWords;
 			rhi::PushConstantRangeDesc constants{};
@@ -379,7 +411,7 @@ namespace tesworld::gpu
 					  program.layout),
 				"pipeline layout");
 			rhi::SubobjLayout layout{ program.layout->GetHandle() };
-			rhi::SubobjShader shader{ rhi::ShaderStage::Compute, { bytes.data(), static_cast<std::uint32_t>(bytes.size()) }, std::string(a_entry) };
+			rhi::SubobjShader shader{ rhi::ShaderStage::Compute, { a_bytes.data(), static_cast<std::uint32_t>(a_bytes.size()) }, std::string(a_entry) };
 			const rhi::PipelineStreamItem items[] = { rhi::Make(layout), rhi::Make(shader) };
 			Check(_device->CreatePipeline(items, 2, program.pipeline), "compute pipeline");
 			return program;
@@ -547,6 +579,100 @@ namespace tesworld::gpu
 			ExecuteFrame([&](rhi::CommandList& a_commands) { a_commands.CopyBufferRegion(destination, 0, source, 0, bytes); }, [staging] {});
 			CompleteAllInFlight();
 			return buffer;
+		}
+
+		SampledTexture ContextImpl::UploadTexture(rhi::Format a_format, std::span<const TextureLevel> a_levels, const char* a_name)
+		{
+			if (a_levels.empty() || a_levels.size() > 16) {
+				throw std::invalid_argument("GPU: a texture needs 1 to 16 mips");
+			}
+			const auto mips = static_cast<std::uint32_t>(a_levels.size());
+			SampledTexture texture{ .width = a_levels[0].width, .height = a_levels[0].height, .mips = mips };
+			Check(_device->CreateCommittedResource(rhi::helpers::ResourceDesc::Tex2D(a_format, rhi::HeapType::DeviceLocal, texture.width, texture.height,
+						  static_cast<std::uint16_t>(mips), 1, 1, rhi::ResourceLayout::Undefined, nullptr, rhi::RF_None, a_name),
+					  texture.resource),
+				a_name);
+			const auto handle = texture.resource->GetHandle();
+			std::vector<rhi::CopyableFootprint> footprints(mips);
+			const auto placed = _device->GetCopyableFootprints(rhi::FootprintRangeDesc{ .texture = handle, .firstMip = 0, .mipCount = mips }, footprints.data(), mips);
+			if (placed.count != mips) {
+				throw std::runtime_error(std::string("GPU: no copy footprints for ") + a_name);
+			}
+			auto staging = std::make_shared<MappedBuffer>(CreateMapped(placed.totalBytes, rhi::HeapType::Upload, a_name));
+			for (std::uint32_t mip = 0; mip < mips; ++mip) {
+				const auto& level = a_levels[mip];
+				const auto& footprint = footprints[mip];
+				if (level.width != footprint.width || level.height != footprint.height) {
+					throw std::invalid_argument(std::string("GPU: ") + a_name + " mip " + std::to_string(mip) + " isn't half the one before");
+				}
+				if (level.rows == 0 || level.rowBytes > footprint.rowPitch ||
+					level.bytes.size() < static_cast<std::uint64_t>(level.rows - 1) * level.rowPitch + level.rowBytes) {
+					throw std::invalid_argument(std::string("GPU: ") + a_name + " mip " + std::to_string(mip) + " is smaller than its rows");
+				}
+				for (std::uint32_t row = 0; row < level.rows; ++row) {
+					std::memcpy(staging->mapped + footprint.offset + static_cast<std::uint64_t>(row) * footprint.rowPitch,
+						level.bytes.data() + static_cast<std::uint64_t>(row) * level.rowPitch, level.rowBytes);
+				}
+			}
+			const auto source = staging->resource->GetHandle();
+			ExecuteFrame(
+				[&](rhi::CommandList& a_commands) {
+					const rhi::TextureSubresourceRange all{ .baseMip = 0, .mipCount = mips };
+					rhi::TextureBarrier toCopy{ .texture = handle,
+						.range = all,
+						.beforeSync = rhi::ResourceSyncState::None,
+						.afterSync = rhi::ResourceSyncState::Copy,
+						.beforeAccess = rhi::ResourceAccessType::None,
+						.afterAccess = rhi::ResourceAccessType::CopyDest,
+						.beforeLayout = rhi::ResourceLayout::Undefined,
+						.afterLayout = rhi::ResourceLayout::CopyDest,
+						.discard = true };
+					a_commands.Barriers(rhi::BarrierBatch{ .textures = { &toCopy, 1 } });
+					for (std::uint32_t mip = 0; mip < mips; ++mip) {
+						rhi::BufferTextureCopyFootprint copy{};
+						copy.texture = handle;
+						copy.buffer = source;
+						copy.mip = mip;
+						copy.arraySlice = 0;
+						copy.footprint = footprints[mip];
+						a_commands.CopyBufferToTexture(copy);
+					}
+					rhi::TextureBarrier toRead{ .texture = handle,
+						.range = all,
+						.beforeSync = rhi::ResourceSyncState::Copy,
+						.afterSync = rhi::ResourceSyncState::All,
+						.beforeAccess = rhi::ResourceAccessType::CopyDest,
+						.afterAccess = rhi::ResourceAccessType::ShaderResource,
+						.beforeLayout = rhi::ResourceLayout::CopyDest,
+						.afterLayout = rhi::ResourceLayout::ShaderResource };
+					a_commands.Barriers(rhi::BarrierBatch{ .textures = { &toRead, 1 } });
+				},
+				[staging] {});
+			CompleteAllInFlight();
+			texture.srv = AllocateDescriptor();
+			rhi::SrvDesc srv{};
+			srv.dimension = rhi::SrvDim::Texture2D;
+			srv.formatOverride = a_format;
+			srv.tex2D.mostDetailedMip = 0;
+			srv.tex2D.mipLevels = mips;
+			Check(_device->CreateShaderResourceView({ _heap->GetHandle(), texture.srv }, handle, srv), "texture SRV");
+			return texture;
+		}
+
+		void ContextImpl::Release(SampledTexture& a_texture)
+		{
+			if (a_texture.srv != layout::kNone) _freeDescriptors.push_back(a_texture.srv);
+			a_texture = {};
+		}
+
+		std::uint32_t ContextImpl::CreateSampler(const rhi::SamplerDesc& a_desc)
+		{
+			if (_nextSampler >= kSamplerCapacity) {
+				throw std::runtime_error("GPU: sampler heap exhausted");
+			}
+			const auto index = _nextSampler++;
+			Check(_device->CreateSampler({ _samplerHeap->GetHandle(), index }, a_desc), "sampler");
+			return index;
 		}
 
 		void ContextImpl::Barrier(rhi::CommandList& a_commands, rhi::ResourceSyncState a_beforeSync, rhi::ResourceAccessType a_beforeAccess,

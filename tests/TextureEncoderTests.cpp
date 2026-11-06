@@ -6,9 +6,12 @@
 #include "tesworld/TextureEncoderGpu.h"
 #endif
 
+#include <oneapi/tbb/parallel_for.h>
+
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <vector>
@@ -168,6 +171,59 @@ namespace
 		}
 		SetFailAfter("");
 	}
+
+	// Finished on the context's thread: callers that block every TBB thread waiting on their encodes still get them,
+	// the same bytes as the default's, and a GPU that fails says so rather than handing the work to TBB tasks.
+	void ContextThreadCompletionNeedsNoTbbThread()
+	{
+		try {
+			gpu::Context context;
+			auto inlineGpu = CreateGpuTextureEncoder(context, Completion::ContextThread);
+			std::vector<MipChain> chains;
+			for (std::uint32_t i = 0; i < 24; ++i) chains.push_back(AtlasLike(256 + 64 * (i % 4), 256, 40 + i, i % 2 == 0));
+			std::vector<EncodeResult> results(chains.size());
+			oneapi::tbb::parallel_for(std::size_t{ 0 }, chains.size(), [&](std::size_t i) {
+				std::promise<EncodeResult> promise;
+				auto future = promise.get_future();
+				inlineGpu->Encode({ chains[i], Format::BC7 }, [&promise](EncodeResult a_result) { promise.set_value(std::move(a_result)); });
+				results[i] = future.get();
+			});
+			inlineGpu->Wait();
+			auto tbbGpu = CreateGpuTextureEncoder(context);
+			for (std::size_t i = 0; i < chains.size(); ++i) {
+				assert(results[i].Ok() && results[i].dds == EncodeNow(*tbbGpu, chains[i], Format::BC7).dds);
+			}
+			const auto small = AtlasLike(96, 64, 13, true);
+			assert(EncodeNow(*inlineGpu, small, Format::BC3).dds == *EncodeDds(small, Format::BC3));
+			std::cout << "context-thread completion: " << chains.size() << " encodes from blocked TBB threads\n";
+		} catch (const gpu::UnsupportedError& e) {
+			std::cout << "no GPU, its tests skipped: " << e.what() << '\n';
+		}
+
+		SetFailAfter("1");
+		try {
+			gpu::Context context;
+			auto gpu = CreateGpuTextureEncoder(context, Completion::ContextThread);
+			std::vector<MipChain> chains;
+			for (std::uint32_t i = 0; i < 6; ++i) chains.push_back(AtlasLike(2048, 2048, 30 + i, false));
+			std::mutex mutex;
+			std::vector<EncodeResult> results(chains.size());
+			for (std::size_t i = 0; i < chains.size(); ++i) {
+				gpu->Encode({ chains[i], Format::BC7 }, [&, i](EncodeResult a_result) {
+					std::scoped_lock lock(mutex);
+					results[i] = std::move(a_result);
+				});
+			}
+			gpu->Wait();
+			std::size_t failed = 0;
+			for (const auto& result : results) failed += result.Ok() ? 0u : 1u;
+			std::cout << "context-thread completion after failing: " << failed << " of " << results.size() << " reported failed\n";
+			assert(failed != 0 && !gpu->Problem().empty());
+		} catch (const gpu::UnsupportedError& e) {
+			std::cout << "no GPU, its tests skipped: " << e.what() << '\n';
+		}
+		SetFailAfter("");
+	}
 #endif
 }
 
@@ -177,6 +233,7 @@ int main()
 #if defined(TESWORLD_TEST_GPU)
 	GpuEncoderMatchesTheCpusQuality();
 	AFailingGpuHandsItsWorkToTheCpu();
+	ContextThreadCompletionNeedsNoTbbThread();
 #endif
 	std::cout << "tesworld texture encoder tests passed\n";
 	return 0;

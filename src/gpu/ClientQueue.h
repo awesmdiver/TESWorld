@@ -26,11 +26,14 @@ namespace tesworld::gpu::detail
 	class ClientQueue
 	{
 	public:
-		// a_fallback does a job elsewhere; it, or what it starts, calls Finished once the job has called back.
-		ClientQueue(ContextImpl& a_gpu, std::size_t a_frameSets, std::function<void(Job)> a_fallback) :
+		// a_fallback does a job elsewhere; it, or what it starts, calls Finished once the job has called back. a_inline runs
+		// what Run is given at once, on the calling thread (the render thread's, for jobs finished there), instead of as a
+		// TBB task: for a client whose callers block TBB threads waiting on their jobs, which a task might wait behind.
+		ClientQueue(ContextImpl& a_gpu, std::size_t a_frameSets, std::function<void(Job)> a_fallback, bool a_inline = false) :
 			_gpu(a_gpu),
 			_frameSets(a_frameSets),
 			_fallback(std::move(a_fallback)),
+			_runInline(a_inline),
 			_arena(oneapi::tbb::task_arena::attach{})
 		{}
 
@@ -64,6 +67,10 @@ namespace tesworld::gpu::detail
 		template <class Task>
 		void Run(Task&& a_task)
 		{
+			if (_runInline) {
+				a_task();
+				return;
+			}
 			_tasks.fetch_add(1, std::memory_order_acq_rel);
 			_arena.enqueue([this, task = std::forward<Task>(a_task)] {
 				task();
@@ -160,6 +167,7 @@ namespace tesworld::gpu::detail
 		ContextImpl& _gpu;
 		std::size_t _frameSets;
 		std::function<void(Job)> _fallback;
+		bool _runInline{ false };
 
 		mutable std::mutex _mutex;
 		std::deque<Job> _queued;

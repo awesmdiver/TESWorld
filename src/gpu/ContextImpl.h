@@ -24,11 +24,26 @@
 #include <thread>
 #include <vector>
 
+// OpenRenderGraph's persistent host: GraphHost over a Runtime since its rebuild (SARP's pin), PersistentGraphHost before
+// (FasterNGIO's, which tesworld fetches). The context drives either the same way.
+#if __has_include(<OpenRenderGraph/GraphHost.h>)
+#define TESWORLD_ORG_GRAPH_HOST 1
+namespace org
+{
+	class Buffer;
+	class GraphHost;
+	class Runtime;
+	using TesworldGraphHost = GraphHost;
+}
+#else
+#define TESWORLD_ORG_GRAPH_HOST 0
 namespace org
 {
 	class Buffer;
 	class PersistentGraphHost;
+	using TesworldGraphHost = PersistentGraphHost;
 }
+#endif
 
 namespace tesworld::gpu::detail
 {
@@ -88,6 +103,27 @@ namespace tesworld::gpu::detail
 		std::uint32_t dsv{ 0xFFFFFFFFu };
 	};
 
+	// A sampled 2D texture with every mip uploaded (Compute::UploadTexture): one SRV over all of them.
+	struct SampledTexture
+	{
+		rhi::ResourcePtr resource;
+		std::uint32_t width{ 0 };
+		std::uint32_t height{ 0 };
+		std::uint32_t mips{ 0 };
+		std::uint32_t srv{ 0xFFFFFFFFu };
+	};
+
+	// One mip as the caller holds it: rows rows of rowBytes, each rowPitch apart.
+	struct TextureLevel
+	{
+		std::uint32_t width{ 0 };
+		std::uint32_t height{ 0 };
+		std::span<const std::byte> bytes;
+		std::uint32_t rowPitch{ 0 };
+		std::uint32_t rowBytes{ 0 };
+		std::uint32_t rows{ 0 };
+	};
+
 	// Work the render thread runs. Pump is called each time the thread wakes, until none has anything to do; it may
 	// execute frames. Fail is called once if the thread fails: the client must finish what it owes.
 	class Client
@@ -121,6 +157,8 @@ namespace tesworld::gpu::detail
 		// ---- Render thread only ----
 		[[nodiscard]] rhi::Device Device();
 		[[nodiscard]] ComputeProgram CreateProgram(std::string_view a_shader, std::string_view a_entry, std::uint32_t a_constantWords);
+		// A kernel from bytecode for the API in use, laid out as the embedded ones.
+		[[nodiscard]] ComputeProgram CreateProgram(std::span<const std::byte> a_bytecode, std::string_view a_entry, std::uint32_t a_constantWords);
 		// Both entries in one shader, "<shader>.VS"/".PS" as the build names them (tesworld_gpu_shader's STAGE).
 		[[nodiscard]] GraphicsProgram CreateGraphicsProgram(const GraphicsProgramDesc& a_desc);
 		// A colour target (a_depth false: with an SRV) or a depth target.
@@ -133,6 +171,11 @@ namespace tesworld::gpu::detail
 		void Release(DeviceBuffer& a_buffer);
 		// A device buffer the kernels read (SRV), its bytes copied in by a frame of its own, waited for.
 		[[nodiscard]] DeviceBuffer Upload(std::span<const std::byte> a_bytes, const char* a_name);
+		// A texture kernels sample, every level copied in by a frame of its own, waited for.
+		[[nodiscard]] SampledTexture UploadTexture(rhi::Format a_format, std::span<const TextureLevel> a_levels, const char* a_name);
+		void Release(SampledTexture& a_texture);
+		// A sampler heap index; samplers live as long as the context.
+		[[nodiscard]] std::uint32_t CreateSampler(const rhi::SamplerDesc& a_desc);
 		// Records a frame and submits it; a_completed runs on this thread once the GPU has finished it.
 		void ExecuteFrame(std::function<void(rhi::CommandList&)> a_record, std::function<void()> a_completed);
 		// Every frame submitted is finished (and its completion run).
@@ -180,13 +223,17 @@ namespace tesworld::gpu::detail
 		rhi::DescriptorHeapPtr _heap;
 		rhi::DescriptorHeapPtr _samplerHeap;
 		std::uint32_t _nextDescriptor{ 0 };
+		std::uint32_t _nextSampler{ 0 };
 		std::vector<std::uint32_t> _freeDescriptors;
 		// Render and depth target views: a few, each a slot of its own heap.
 		rhi::DescriptorHeapPtr _rtvHeap;
 		rhi::DescriptorHeapPtr _dsvHeap;
 		std::vector<std::uint32_t> _freeRtvs;
 		std::vector<std::uint32_t> _freeDsvs;
-		std::unique_ptr<org::PersistentGraphHost> _host;
+#if TESWORLD_ORG_GRAPH_HOST
+		std::shared_ptr<org::Runtime> _runtime;
+#endif
+		std::unique_ptr<org::TesworldGraphHost> _host;
 		std::shared_ptr<org::Buffer> _heartbeat;
 		std::shared_ptr<PassContext> _passContext;
 		std::vector<Client*> _clients;

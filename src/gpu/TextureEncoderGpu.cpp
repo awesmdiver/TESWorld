@@ -50,11 +50,12 @@ namespace tesworld::texture
 		class GpuTextureEncoder final : public TextureEncoder, public gpu::detail::Client
 		{
 		public:
-			explicit GpuTextureEncoder(gpu::Context& a_context) :
+			GpuTextureEncoder(gpu::Context& a_context, Completion a_completion) :
 				_context(a_context),
 				_gpu(a_context.Impl()),
 				_cpu(CreateCpuTextureEncoder()),
-				_queue(_gpu, kFrameSets, [this](Job a_job) { EncodeOnCpu(std::move(a_job)); })
+				_completion(a_completion),
+				_queue(_gpu, kFrameSets, [this](Job a_job) { EncodeOnCpu(std::move(a_job)); }, a_completion == Completion::ContextThread)
 			{
 				// Each frame set's scratch, blocks and readback on the device (the upload is host memory).
 				const auto frameBytes = static_cast<double>(kFrameTexels) * (4 + 1 + 1) * 4 / 3;
@@ -85,6 +86,12 @@ namespace tesworld::texture
 			void Encode(EncodeRequest a_request, Callback a_done) override
 			{
 				if (a_request.format != Format::BC7 || a_request.chain.Empty()) {
+					if (_completion == Completion::ContextThread) {
+						EncodeResult result;
+						if (auto dds = EncodeDds(a_request.chain, a_request.format, &result.error)) result.dds = std::move(*dds);
+						a_done(std::move(result));
+						return;
+					}
 					_cpu->Encode(std::move(a_request), std::move(a_done));
 					return;
 				}
@@ -176,6 +183,12 @@ namespace tesworld::texture
 			void EncodeOnCpu(Job a_job)
 			{
 				auto done = std::move(a_job.done);
+				if (_completion == Completion::ContextThread) {
+					// The caller encodes it itself: the CPU encoder's own tasks are what it can't wait on.
+					done(EncodeResult{ .error = "the GPU failed (" + _queue.Failure() + ")" });
+					_queue.Finished();
+					return;
+				}
 				_cpu->Encode(std::move(a_job.request), [this, done = std::move(done)](EncodeResult a_result) {
 					done(std::move(a_result));
 					_queue.Finished();
@@ -185,6 +198,7 @@ namespace tesworld::texture
 			gpu::Context& _context;
 			ContextImpl& _gpu;
 			std::unique_ptr<TextureEncoder> _cpu;
+			Completion _completion;
 
 			// Render thread only.
 			std::optional<ImagePrograms> _images;
@@ -194,8 +208,8 @@ namespace tesworld::texture
 		};
 	}
 
-	std::unique_ptr<TextureEncoder> CreateGpuTextureEncoder(gpu::Context& a_context)
+	std::unique_ptr<TextureEncoder> CreateGpuTextureEncoder(gpu::Context& a_context, Completion a_completion)
 	{
-		return std::make_unique<GpuTextureEncoder>(a_context);
+		return std::make_unique<GpuTextureEncoder>(a_context, a_completion);
 	}
 }
