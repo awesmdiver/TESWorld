@@ -3669,34 +3669,50 @@ namespace tesworld
 				}
 			}
 
+			// Each placement's destination is decided in parallel into its own slot, then appended in winning order,
+			// so every cell lists its placements in the same order as the sequential path, on every run. (Merging
+			// per-thread buckets made the order depend on which thread took which range.)
+			enum class BucketTarget : std::uint8_t { None, Exterior, Interior, Orphan };
+			struct BucketedPlacement
+			{
+				BucketTarget target{ BucketTarget::None };
+				CellKey exteriorKey{};
+				FormID interiorCell{};
+				PlacementInfo placement;
+			};
+			std::vector<BucketedPlacement> bucketed(winningPlacements.size());
 			oneapi::tbb::enumerable_thread_specific<LocalStaticPlacementBuckets> localBuckets;
 			oneapi::tbb::parallel_for(
 				oneapi::tbb::blocked_range<std::size_t>(0, winningPlacements.size(), 4096),
 				[&](const oneapi::tbb::blocked_range<std::size_t>& range) {
 					auto& local = localBuckets.local();
 					for (std::size_t i = range.begin(); i != range.end(); ++i) {
-						PlacementInfo placement = *winningPlacements[i];
-						if (placement.IsInitiallyDisabled() && !a_options.includeDisabledPlacements) {
+						const PlacementInfo& source = *winningPlacements[i];
+						if (source.IsInitiallyDisabled() && !a_options.includeDisabledPlacements) {
 							++local.disabled;
 							continue;
 						}
-						if (!snapshot.baseObjectsByFormID.contains(placement.baseFormID)) {
+						if (!snapshot.baseObjectsByFormID.contains(source.baseFormID)) {
 							++local.missingBase;
 							continue;
 						}
-						const auto cellIt = snapshot.cellsByFormID.find(placement.parentCell);
+						auto& slot = bucketed[i];
+						slot.placement = source;
+						const auto cellIt = snapshot.cellsByFormID.find(source.parentCell);
 						if (cellIt == snapshot.cellsByFormID.end()) {
 							++local.missingCell;
-							local.orphan.push_back(std::move(placement));
+							slot.target = BucketTarget::Orphan;
 							continue;
 						}
 
 						const auto& cell = cellIt->second;
-						placement.worldFormID = cell.worldFormID;
-						if (auto exteriorKey = ResolvePlacementExteriorCellKey(cell, placement)) {
-							local.exterior.emplace_back(*exteriorKey, std::move(placement));
+						slot.placement.worldFormID = cell.worldFormID;
+						if (auto exteriorKey = ResolvePlacementExteriorCellKey(cell, slot.placement)) {
+							slot.target = BucketTarget::Exterior;
+							slot.exteriorKey = *exteriorKey;
 						} else {
-							local.interior.emplace_back(cell.formID, std::move(placement));
+							slot.target = BucketTarget::Interior;
+							slot.interiorCell = cell.formID;
 						}
 						++local.winning;
 					}
@@ -3707,16 +3723,21 @@ namespace tesworld
 				snapshot.buildStats.skippedDisabledPlacements += local.disabled;
 				snapshot.buildStats.skippedMissingBasePlacements += local.missingBase;
 				snapshot.buildStats.skippedMissingCellPlacements += local.missingCell;
-				for (auto& [cellKey, placement] : local.exterior) {
-					snapshot.exteriorPlacementsByCell[cellKey].push_back(std::move(placement));
+			}
+			for (auto& slot : bucketed) {
+				switch (slot.target) {
+				case BucketTarget::Exterior:
+					snapshot.exteriorPlacementsByCell[slot.exteriorKey].push_back(std::move(slot.placement));
+					break;
+				case BucketTarget::Interior:
+					snapshot.interiorPlacementsByCell[slot.interiorCell].push_back(std::move(slot.placement));
+					break;
+				case BucketTarget::Orphan:
+					snapshot.orphanPlacements.push_back(std::move(slot.placement));
+					break;
+				case BucketTarget::None:
+					break;
 				}
-				for (auto& [cellFormID, placement] : local.interior) {
-					snapshot.interiorPlacementsByCell[cellFormID].push_back(std::move(placement));
-				}
-				snapshot.orphanPlacements.insert(
-					snapshot.orphanPlacements.end(),
-					std::make_move_iterator(local.orphan.begin()),
-					std::make_move_iterator(local.orphan.end()));
 			}
 		} else {
 			for (auto shardIt = a_shards.rbegin(); shardIt != a_shards.rend(); ++shardIt) {
