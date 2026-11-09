@@ -2270,12 +2270,27 @@ namespace tesworld
 		return result;
 	}
 
+	namespace
+	{
+		// Rethrows a plugin read error with the plugin's file name in front, so a player can tell which plugin it is.
+		// A message that already names the plugin is left as it is.
+		[[noreturn]] void ThrowNamingPlugin(const LoadOrderEntry& a_entry, const std::exception& a_error)
+		{
+			const auto name = platform::PathToUtf8(a_entry.path.filename());
+			const std::string_view what = a_error.what();
+			if (what.find(name) != std::string_view::npos) {
+				throw std::runtime_error(std::string(what));
+			}
+			throw std::runtime_error(name + ": " + std::string(what));
+		}
+	}
+
 	PluginFile PluginParser::Parse(
 		const LoadOrderEntry& a_entry,
 		std::size_t a_sourceFileIndex,
 		std::span<const LoadOrderEntry> a_loadOrder,
 		ParseMode a_mode) const
-	{
+	try {
 		PluginFile plugin{};
 		plugin.entry = a_entry;
 		plugin.bytes = ReadFileBytes(a_entry.path);
@@ -2304,13 +2319,15 @@ namespace tesworld
 		}
 		ParseRange(bytes, 24 + tes4.dataSize, bytes.size(), plugin, context);
 		return plugin;
+	} catch (const std::exception& error) {
+		ThrowNamingPlugin(a_entry, error);
 	}
 
 	StaticPluginShard PluginParser::ParseStaticWorldShard(
 		const LoadOrderEntry& a_entry,
 		std::size_t a_sourceFileIndex,
 		std::span<const LoadOrderEntry> a_loadOrder, ParseMode a_mode) const
-	{
+	try {
 		const auto totalBegin = Clock::now();
 		StaticPluginShard shard{};
 		shard.entry = a_entry;
@@ -2376,6 +2393,8 @@ namespace tesworld
 		shard.stats.scanMilliseconds = ElapsedMilliseconds(scanBegin);
 		shard.stats.totalMilliseconds = ElapsedMilliseconds(totalBegin);
 		return shard;
+	} catch (const std::exception& error) {
+		ThrowNamingPlugin(a_entry, error);
 	}
 
 	std::vector<LoadOrderEntry> PrepareLoadOrder(std::vector<LoadOrderEntry> a_entries, HeaderCache* a_headerCache)

@@ -64,6 +64,8 @@ void CellFieldsAndCompleteInflation() {
         try { (void)f.Read(data, true, corruption); } catch (const std::runtime_error&) { failed = true; }
         assert(failed);
     }
+    // A read error names the plugin file, so a player can tell which plugin it is.
+    try { (void)f.Read(data, true, 1); assert(false); } catch (const std::runtime_error& e) { assert(std::string(e.what()).starts_with(f.path.filename().string() + ": ")); }
     data.push_back(0); // Partial trailing subrecord must not be accepted.
     bool failed = false;
     try { (void)f.Read(data, true); } catch (const std::runtime_error&) { failed = true; }
