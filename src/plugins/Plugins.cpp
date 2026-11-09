@@ -1590,7 +1590,10 @@ namespace tesworld
 
 			++a_stats.streamedCellRecords;
 			a_stats.streamedCellOutputBytes += scan.outputBytes;
-			if (scan.outputBytes != expectedSize || scan.consumed != a_pendingScratch.size() || stream.avail_in != 0)
+			// Bytes left in the input after the stream ended (Z_STREAM_END) are ignored: some plugins pad a compressed record
+			// with a few bytes, and the record's own size already bounds the data. The game ignores the padding, and so does
+			// uncompress(), which this file's other inflate sites use. The inflated length and the subrecords must still match.
+			if (scan.outputBytes != expectedSize || scan.consumed != a_pendingScratch.size())
 				throw std::runtime_error("invalid compressed CELL length or trailing data");
 			return scan.info;
 		}

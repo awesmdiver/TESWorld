@@ -36,7 +36,7 @@ struct Fixture {
             payload.insert(payload.end(), packed.begin(), packed.end());
             if (corruption == 2) payload.pop_back();
             if (corruption == 3) payload.back() ^= 0xFF;
-            if (corruption == 4) payload.push_back(0);
+            if (corruption >= 4) payload.insert(payload.end(), corruption == 4 ? 1u : corruption == 5 ? 5u : 10u, 0x5A); // Bytes after the stream end.
         }
         Bytes bytes; Record(bytes, "TES4", 0, 0, {}); Record(bytes, "CELL", 0x800, compressed ? 0x40000u : 0u, payload);
         { std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
@@ -59,10 +59,18 @@ void CellFieldsAndCompleteInflation() {
         }
     }
     assert((f.Read(data, true).cells[0].fields & CellInfo::FieldEditorID) == 0);
-    for (int corruption = 1; corruption <= 4; ++corruption) {
+    for (int corruption = 1; corruption <= 3; ++corruption) {
         bool failed = false;
         try { (void)f.Read(data, true, corruption); } catch (const std::runtime_error&) { failed = true; }
         assert(failed);
+    }
+    // The record's own size bounds it: bytes after the end of the zlib stream are ignored, as the game ignores them.
+    for (int corruption = 4; corruption <= 6; ++corruption) {
+        const auto shard = f.Read(data, true, corruption);
+        assert(shard.cells.size() == 1 && shard.cells[0].formID == FormID{ 0x800 });
+        const auto plain = f.Read(data, false);
+        assert(shard.cells[0].fields == plain.cells[0].fields);
+        assert(shard.cells[0].gridX == plain.cells[0].gridX && shard.cells[0].gridY == plain.cells[0].gridY);
     }
     data.push_back(0); // Partial trailing subrecord must not be accepted.
     bool failed = false;
